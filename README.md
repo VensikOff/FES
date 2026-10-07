@@ -1,6 +1,7 @@
 # FES
 FE Scripts made by me
-1. NPC Controller FE
+
+## 1. NPC Controller FE
 ```
 loadstring(game:HttpGet("https://raw.githubusercontent.com/VensikOff/FES/refs/heads/main/NPCController/lastest.luau"))()
 ```
