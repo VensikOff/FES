@@ -1,4 +1,4 @@
--- NPC Controller FE v7.3
+-- NPC Controller FE v8.2
 -- Idea: Vensik | Made by Claude AI
 
 local P, RS, UIS = game:GetService("Players"), game:GetService("RunService"), game:GetService("UserInputService")
@@ -15,12 +15,17 @@ local S = {
 	aiRate = 60,        -- anti-AI: MoveTo(own position) per second
 	jitRate = 60,       -- jitter steps per second
 	jitAmp = 0.01,      -- jitter size, studs
-	jitter = true,      -- jitter on NPCs whose AI is held down (controlled / AI off / frozen / pocket)
-	aiSpam = false,     -- anti-AI MoveTo spam (off by default)
-	autoBan = true,     -- automatically ban anchored NPCs (they cannot be controlled anyway)
+	jitter = true,      -- jitter on NPCs whose AI is held down
+	aiSpam = false,     -- anti-AI MoveTo spam
+	autoBan = false,    -- automatically ban NPCs whose body is anchored to the map
+	tryAll = false,     -- Try on non-owned NPCs: apply anyway, then check and roll back if it did not work
+	tryWait = 1.5,      -- seconds to wait before that check
 	freezeMode = "hard",-- "soft" / "hard" / "full"
 	hideDepth = 5,      -- Keep my char near: my body hides this deep under the NPC
 	pocketDepth = 5,    -- Pocket: NPCs float this deep under me
+	orbitRadius = 8,    -- Orbit: distance from me, studs
+	orbitSpeed = 90,    -- Orbit: degrees per second
+	claimHeight = 5,    -- Claim ownership: I hover this high above the NPC
 	interval = 2,       -- auto-scan, seconds
 	spin = 300,         -- spin speed, degrees per second
 }
@@ -29,18 +34,24 @@ local NEXT = { soft = "hard", hard = "full", full = "soft" }
 
 ---------------------------------------------------------------- state
 local npcs, nextId, selected, primary, anchorSel = {}, 0, {}, nil, nil
-local controlling, possessed, homeChar, saved, spectating = nil, false, nil, nil, nil
-local freezeAll, pocketAll = false, false -- also applied to NPCs that appear later
-local keepClose, moveMode, addMode, autoScan, lastScan, espAll = true, false, false, false, 0, false -- Keep my char near: ON by default
+local allSel, applyNew, allState, allFns, allVals = false, false, {}, {}, {} -- "All NPCs" + "Apply to new NPCs"
+local controlling, possessed, homeChar, saved, spectating, claim = nil, false, nil, nil, nil, nil
+local keepClose, moveMode, addMode, autoScan, lastScan = true, false, false, false, 0
 local ignored, banned = setmetatable({}, { __mode = "k" }), {}
 local collideSaved, homeCF, bodyMoved, hiddenNow = nil, nil, false, false
 local order, features, fields = 0, {}, {}
-local refresh, setStatus, rebuildBans, setPocket, closeAll
+local refresh, setStatus, rebuildBans, setCarry, closeAll, endClaim, settingsBox, claimBtn, applyRow, verifyTry
 local alive, conns = true, {}
 local function track(c) conns[#conns + 1] = c return c end
 local function nxt() order += 1 return order end
 local function fmt(n) return tostring(math.floor(n * 1000 + 0.5) / 1000) end
 local function byId(a, b) return a.id < b.id end
+-- is the NPC's BODY stuck to something anchored? IsGrounded only looks at parts joined to the root,
+-- so an anchored item that just lies inside the model (not welded to the body) does not count
+local function grounded(root)
+	local ok, g = pcall(root.IsGrounded, root)
+	return ok and g or false
+end
 
 local controls
 task.spawn(function()
@@ -86,12 +97,11 @@ end
 local old = pgui:FindFirstChild("NPCController")
 if old then old:Destroy() end
 local gui = T("ScreenGui", pgui, { Name = "NPCController", ResetOnSpawn = false, DisplayOrder = 999, IgnoreGuiInset = true })
-local toggle = T("TextButton", gui, { Size = UDim2.new(0, 84, 0, 28), Position = UDim2.new(0, 10, 0, 44), Text = "NPC Menu", Font = Enum.Font.GothamBold })
+local toggle = T("TextButton", gui, { Size = UDim2.new(0, 84, 0, 28), Position = UDim2.new(0, 10, 0.5, -14), Text = "NPC Menu", Font = Enum.Font.GothamBold })
 local main = T("Frame", gui, { Size = UDim2.new(0, 700, 0, 480), Position = UDim2.new(0, 20, 0.5, -240), BackgroundColor3 = C.bg })
 local title = T("TextLabel", main, {
 	Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 0, BackgroundColor3 = C.pn, Active = true,
-	Text = "  NPC Controller FE v7.3 By Vensik",
-	TextXAlignment = Enum.TextXAlignment.Left, Font = Enum.Font.GothamBold, TextSize = 13,
+	Text = "  NPC Controller FE v8.2 By Vensik", TextXAlignment = Enum.TextXAlignment.Left, Font = Enum.Font.GothamBold, TextSize = 13,
 })
 local grip = T("TextButton", main, { Size = UDim2.new(0, 22, 0, 22), Position = UDim2.new(1, -22, 1, -22), Text = "//", ZIndex = 10 })
 -- top right: "-" = minimize (open again with the NPC Menu button), "X" = close the script and undo everything
@@ -142,10 +152,62 @@ makeDrag(toggle, function() tgMoved = false return toggle.Position end, function
 end)
 toggle.MouseButton1Click:Connect(function() if not tgMoved then main.Visible = not main.Visible end end)
 
+---------------------------------------------------------------- ownership
+-- Checked EVERY frame. ReceiveAge = time since the server last sent this part's physics.
+-- Exactly 0 every frame = nobody sends it = my client simulates it. A part owned by the server or
+-- another player gets updates, so its ReceiveAge is above 0 at least now and then -> red.
+-- 8 frames of exact 0 in a row are needed, so one lucky frame can't give a false green.
+local OWN = { mine = Color3.fromRGB(60, 220, 90), other = Color3.fromRGB(230, 60, 60), none = Color3.fromRGB(255, 160, 40), unk = Color3.fromRGB(150, 150, 150) }
+local OWNTXT = { mine = "you own it", other = "NOT yours", none = "cannot be controlled", unk = "owner unknown" }
+local warnedAge = false
+local function ownStep()
+	for _, d in pairs(npcs) do
+		if d.hum.Health <= 0 or d.anchored then
+			d.own, d.zeroRun = "none", 0
+		else
+			local ok, age = pcall(function() return d.root.ReceiveAge end)
+			if not ok or type(age) ~= "number" then
+				if not warnedAge then warnedAge = true bad("BasePart.ReceiveAge is not readable - ownership will show gray.") end
+				d.own = "unk"
+			else
+				d.zeroRun = age == 0 and d.zeroRun + 1 or 0
+				d.own = d.zeroRun >= 8 and "mine" or "other"
+			end
+		end
+	end
+end
+local function isMine(d) return d.own == "mine" or d.own == "unk" end
+-- run fn on the NPCs I own, report the rest in ONE message
+-- With "Try on non-owned" ON, non-owned NPCs get the action too, then verifyTry checks it and rolls back.
+-- NPCs whose body is anchored to the map are always skipped - they cannot move for anyone.
+local function forOwned(t, what, fn)
+	local skipped, done = {}, {}
+	for _, d in ipairs(t) do
+		if isMine(d) then
+			fn(d) done[d] = true
+		elseif S.tryAll and not d.anchored and d.hum.Health > 0 then
+			verifyTry(d, what, fn) done[d] = true
+		else
+			skipped[#skipped + 1] = d.model.Name
+		end
+	end
+	if #skipped > 0 then
+		local names = table.concat(skipped, ", ", 1, math.min(#skipped, 6)) .. (#skipped > 6 and (" +" .. (#skipped - 6) .. " more") or "")
+		local msg = what .. " skipped - not yours: " .. names .. ". Try Claim ownership (Other)" .. (S.tryAll and "." or " or turn on 'Try on non-owned'.")
+		bad(msg) setStatus(msg)
+	end
+	return done
+end
+
 ---------------------------------------------------------------- selection helpers
 local function selCount() local n = 0 for _ in pairs(selected) do n += 1 end return n end
 local function targets()
 	local t = {}
+	if allSel then
+		for _, d in pairs(npcs) do if d.hum.Parent then t[#t + 1] = d end end
+		table.sort(t, byId)
+		return t
+	end
 	for d in pairs(selected) do if npcs[d.model] == d and d.hum.Parent then t[#t + 1] = d end end
 	table.sort(t, byId)
 	return t
@@ -156,20 +218,40 @@ local function need()
 	return t
 end
 local function getPrimary()
+	if allSel then return nil end
 	if not (primary and selected[primary]) then primary = targets()[1] end
 	return primary
 end
-local function any(prop) for d in pairs(selected) do if d[prop] then return true end end return false end
-local function toggleProp(prop, fn)
+local function any(prop) for _, d in ipairs(targets()) do if d[prop] then return true end end return false end
+-- for things that only make sense on one NPC (Control, Spectate, Claim, Go To)
+local function one()
+	if allSel then bad("Pick one NPC for this, not 'All NPCs'.") setStatus("Pick one NPC for this, not 'All NPCs'.") return nil end
+	local p = getPrimary()
+	if not p then need() end
+	return p
+end
+-- on/off feature for the selection. Turning ON needs ownership (if needOwn). With "All NPCs" selected
+-- the choice is remembered, so "Apply to new NPCs" can give it to NPCs that appear later.
+local EXCL = { frozen = { "pocket", "orbit" }, pocket = { "frozen", "orbit" }, orbit = { "frozen", "pocket" } }
+local function toggleProp(prop, fn, what, needOwn)
 	local t = need()
 	if #t == 0 then return end
 	local s = not any(prop)
-	for _, d in ipairs(t) do fn(d, s) end
+	local done = {}
+	if s and needOwn then done = forOwned(t, what, function(d) fn(d, true) end)
+	else for _, d in ipairs(t) do fn(d, s) done[d] = true end end
+	if allSel then
+		allState[prop], allFns[prop] = s, fn
+		if s then for _, o in ipairs(EXCL[prop] or {}) do allState[o] = false end end
+		-- the ones that did not get it (not yours / anchored) stay "pending": Apply to new gives it to them
+		-- as soon as they become yours, get unanchored, or respawn
+		for _, d in pairs(npcs) do d.newDone = done[d] or false end
+	end
 end
 
 ---------------------------------------------------------------- NPC logic
--- "suppressed" = the NPC's own AI must be held down. Anti-AI and jitter run on all of them.
-local function suppressed(d) return controlling == d or d.aiOff or d.frozen or d.pocket end
+-- "suppressed" = the NPC's own AI must be held down. Anti-AI spam and jitter run on them.
+local function suppressed(d) return controlling == d or d.aiOff or d.frozen or d.pocket or d.orbit end
 
 local function applyStats(d)
 	local h = d.hum
@@ -183,6 +265,10 @@ local function cancelPath(d) d.pathId = (d.pathId or 0) + 1 d.target = nil end
 local function unJitter(d)
 	if d.jitUp then pcall(function() d.root.CFrame -= Vector3.new(0, d.jitUp, 0) end) d.jitUp = nil end
 end
+local function setAlpha(v) -- local only: other players never see this
+	local c = myChar()
+	if c then for _, p in ipairs(c:GetDescendants()) do if p:IsA("BasePart") or p:IsA("Decal") then p.LocalTransparencyModifier = v end end end
+end
 -- collisions off for a model (store = part -> original CanCollide), and back
 local function noclip(model, store)
 	if not model then return end
@@ -193,19 +279,15 @@ local function noclip(model, store)
 		end
 	end
 end
-local function setAlpha(v) -- local only: other players never see this
-	local c = myChar()
-	if c then for _, p in ipairs(c:GetDescendants()) do if p:IsA("BasePart") or p:IsA("Decal") then p.LocalTransparencyModifier = v end end end
-end
 local function unclip(store) for p, v in pairs(store) do if p.Parent then p.CanCollide = v end end end
 
 -- Freeze. soft = WalkSpeed 0 + anti-AI + jitter. hard = + AlignPosition/AlignOrientation (cannot be pushed).
 -- full = hard + PlatformStand (the Humanoid stops walking at all, AI commands do nothing).
-local function pinFrozen(d) -- point the freeze anchors at d.frozenCF
+local function pinFrozen(d)
 	if d.movers then d.movers[2].Position, d.movers[3].CFrame = d.frozenCF.Position, d.frozenCF end
 end
 local function setFrozen(d, s)
-	if s and d.pocket then setPocket(d, false) end
+	if s and (d.pocket or d.orbit) then setCarry(d, nil) end
 	d.frozen, d.lost = s, false
 	for _, o in ipairs(d.movers or {}) do pcall(o.Destroy, o) end
 	d.movers = nil
@@ -228,17 +310,20 @@ local function setFrozen(d, s)
 	applyStats(d)
 end
 
--- Pocket: the NPC floats right under me, so I am always the closest player and keep its ownership.
-setPocket = function(d, s)
-	if s == (d.pocket or false) then return end
-	if s then
+-- Carry: "pocket" = NPC floats right under me, "orbit" = NPC circles around me, nil = release.
+-- I stay the closest player either way, so I keep its ownership.
+setCarry = function(d, mode)
+	local cur = d.pocket and "pocket" or d.orbit and "orbit" or nil
+	if cur == mode then return end
+	if mode then
 		if d.frozen then setFrozen(d, false) end
-		d.following = false
+		d.following, d.spinning = false, false
 		cancelPath(d)
-		d.pocket, d.coll = true, {}
+		d.coll = d.coll or {}
+		d.pocket, d.orbit = mode == "pocket", mode == "orbit"
 		d.hum.PlatformStand = true
 	else
-		d.pocket = false
+		d.pocket, d.orbit = false, false
 		if d.coll then unclip(d.coll) d.coll = nil end
 		pcall(function() d.hum.PlatformStand = false end)
 		local mr = myRoot()
@@ -250,20 +335,77 @@ setPocket = function(d, s)
 	end
 end
 
+-- Try on non-owned: remember the NPC, apply the action, wait, and if the NPC still is not mine the effect
+-- only exists on my screen -> undo it (the server keeps its own version anyway)
+local function snapshot(d)
+	return { frozen = d.frozen, pocket = d.pocket, orbit = d.orbit, aiOff = d.aiOff, spinning = d.spinning,
+		following = d.following, speed = d.speed, jumpPower = d.jumpPower, jumpEdited = d.jumpEdited,
+		health = d.hum.Health, sit = d.hum.Sit, cf = d.root.CFrame }
+end
+local function rollback(d, sn)
+	if (d.pocket and not sn.pocket) or (d.orbit and not sn.orbit) then setCarry(d, nil) end
+	if d.frozen and not sn.frozen then setFrozen(d, false) end
+	d.aiOff, d.spinning, d.following = sn.aiOff, sn.spinning, sn.following
+	d.speed, d.jumpPower, d.jumpEdited = sn.speed, sn.jumpPower, sn.jumpEdited
+	cancelPath(d)
+	unJitter(d)
+	pcall(applyStats, d)
+	pcall(function()
+		if d.hum.Health <= 0 and sn.health > 0 then d.hum.Health = sn.health end
+		d.hum.Sit = sn.sit
+		d.root.CFrame = sn.cf
+	end)
+	d.newDone = false -- Apply to new can try again once it is really mine
+end
+verifyTry = function(d, what, fn)
+	local sn = snapshot(d)
+	fn(d)
+	task.delay(S.tryWait, function()
+		if not alive or npcs[d.model] ~= d then return end
+		if isMine(d) then
+			log(what, "on", d.model.Name, "worked - it is yours now.")
+		else
+			local ok = pcall(rollback, d, sn)
+			bad(what, "on", d.model.Name, "did not work (still not yours) -", ok and "rolled back." or "rollback failed.")
+			setStatus(what .. " on " .. d.model.Name .. " did not work - rolled back.")
+		end
+	end)
+end
+
 local function hudText()
 	if controlling then
-		hud.Text, hud.Visible = "Controlling " .. controlling.model.Name .. (possessed and "" or " [direct]") .. "  -  click here to stop", true
+		hud.Text = "Controlling " .. controlling.model.Name .. (possessed and "" or " [direct]") .. "  -  click here to stop"
+	elseif claim then
+		hud.Text = "Claiming " .. claim.d.model.Name .. ": pick an action when its dot turns green  -  click here to cancel"
 	elseif spectating then
-		hud.Text, hud.Visible = "Watching " .. spectating.model.Name .. "  -  click here to stop", true
-	else
-		hud.Visible = false
+		hud.Text = "Watching " .. spectating.model.Name .. "  -  click here to stop"
 	end
+	hud.Visible = (controlling or claim or spectating) and true or false
 end
 local function stopSpectate()
 	if not spectating then return end
 	spectating = nil
 	local h = myHum()
 	if h then workspace.CurrentCamera.CameraSubject = h end
+	hudText()
+end
+-- Claim ownership: hover above the NPC (I become the closest player), then any action brings me back
+endClaim = function()
+	if not claim then return end
+	local c = claim
+	claim = nil
+	local r = myRoot()
+	if r then
+		r.Anchored = false
+		if c.home then r.CFrame, r.AssemblyLinearVelocity = c.home, Vector3.zero end
+	end
+	hudText()
+end
+local function startClaim(d)
+	local r = myRoot()
+	if not r then bad("Your character is not loaded.") return end
+	claim = { d = d, home = r.CFrame, told = false }
+	setStatus("Claiming " .. d.model.Name .. "... wait for a green dot, then pick an action.")
 	hudText()
 end
 
@@ -307,13 +449,29 @@ end
 
 local function startControl(d)
 	if controlling == d then return end
+	if d.anchored then bad(d.model.Name, "is anchored to the map - it cannot move.") setStatus(d.model.Name .. " is anchored - it cannot move.") return end
+	local trying = not isMine(d)
+	if trying and not S.tryAll then
+		bad(d.model.Name, "is not yours - controlling it would only move it on your screen. Try Claim ownership.")
+		setStatus(d.model.Name .. " is not yours. Try Claim ownership (Other) or turn on 'Try on non-owned'.")
+		return
+	end
+	if trying then -- check after a moment; stop if it still is not mine
+		task.delay(S.tryWait, function()
+			if alive and controlling == d and not isMine(d) then
+				stopControl("not yours - the server rejected it")
+				bad("Control of", d.model.Name, "did not work (still not yours) - stopped.")
+				setStatus("Control of " .. d.model.Name .. " did not work - stopped.")
+			end
+		end)
+	end
 	if controlling then stopControl("switch") end
 	if d.hum.Health <= 0 then bad(d.model.Name, "is dead.") return end
 	local c = player.Character
 	local ch = c and c:FindFirstChildOfClass("Humanoid")
 	if not ch then bad("Your character has no Humanoid yet.") return end
 	stopSpectate()
-	if d.pocket then setPocket(d, false) end
+	if d.pocket or d.orbit then setCarry(d, nil) end
 	if d.frozen then setFrozen(d, false) end
 	homeChar, controlling = c, d
 	local hr = c:FindFirstChild("HumanoidRootPart")
@@ -333,7 +491,6 @@ local function startControl(d)
 	cam.CameraType, cam.CameraSubject = Enum.CameraType.Custom, d.hum
 	main.Visible = false
 	hudText()
-	if d.root.Anchored then bad(d.model.Name, ": root part is Anchored - it will not move.") end
 	log("Controlling", d.model:GetFullName())
 end
 
@@ -375,13 +532,14 @@ local function removeNPC(d, byUser)
 	if npcs[d.model] ~= d then return end
 	if controlling == d then stopControl("NPC removed") end
 	if spectating == d then stopSpectate() end
+	if claim and claim.d == d then endClaim() end
 	if byUser then ignored[d.model] = true end
 	selected[d] = nil
 	if primary == d then primary = nil end
 	if anchorSel == d then anchorSel = nil end
 	d.following, d.spinning, d.aiOff = false, false, false
 	cancelPath(d)
-	pcall(setPocket, d, false)
+	pcall(setCarry, d, nil)
 	pcall(setFrozen, d, false)
 	d.speed, d.jumpEdited = d.o.speed, false
 	unJitter(d)
@@ -402,6 +560,7 @@ end
 local function onRowClick(d)
 	local ctrl = UIS:IsKeyDown(Enum.KeyCode.LeftControl) or UIS:IsKeyDown(Enum.KeyCode.RightControl)
 	local shiftKey = UIS:IsKeyDown(Enum.KeyCode.LeftShift) or UIS:IsKeyDown(Enum.KeyCode.RightShift)
+	allSel = false -- clicking a normal NPC leaves "All NPCs"
 	if shiftKey and anchorSel and npcs[anchorSel.model] == anchorSel then
 		if not ctrl then table.clear(selected) end
 		local lo, hi = math.min(anchorSel.id, d.id), math.max(anchorSel.id, d.id)
@@ -427,7 +586,8 @@ local function addNPC(model, hum, root)
 	nextId += 1
 	local d = {
 		id = nextId, model = model, hum = hum, root = root, dist = 0, speed = hum.WalkSpeed, jumpPower = hum.JumpPower,
-		o = { speed = hum.WalkSpeed, jp = hum.JumpPower, jh = hum.JumpHeight, useJP = hum.UseJumpPower }, aiAcc = 0, jitAcc = 0,
+		o = { speed = hum.WalkSpeed, jp = hum.JumpPower, jh = hum.JumpHeight, useJP = hum.UseJumpPower },
+		aiAcc = 0, jitAcc = 0, zeroRun = 0, own = "other", newDone = false, anchored = grounded(root),
 	}
 	d.row = T("Frame", list, { Size = UDim2.new(1, -6, 0, 28), BackgroundTransparency = 1, LayoutOrder = d.id })
 	d.btn = T("TextButton", d.row, { Size = UDim2.new(1, -66, 1, 0), BackgroundColor3 = C.bg, Text = model.Name, TextXAlignment = Enum.TextXAlignment.Left })
@@ -441,27 +601,9 @@ local function addNPC(model, hum, root)
 	d.btn.MouseButton1Click:Connect(function() onRowClick(d) end)
 	d.hl = T("Highlight", model, { Adornee = model, DepthMode = Enum.HighlightDepthMode.AlwaysOnTop, FillTransparency = 0.55, Enabled = false })
 	npcs[model], ignored[model] = d, nil
-	if hum.Health > 0 and not root.Anchored then
-		if pocketAll then pcall(setPocket, d, true) elseif freezeAll then pcall(setFrozen, d, true) end
-	end
-	if root.Anchored then bad(model.Name, ": root part is Anchored - it will not move. Unanchor it.") end
 	if hum.Health <= 0 then bad(model.Name, ": Health = 0, it is dead.") end
 	log("Added:", model:GetFullName())
 	return d
-end
-
--- ownership: green = you simulate it, red = someone else does, orange = cannot be controlled, gray = unknown
-local OWN = { mine = Color3.fromRGB(60, 220, 90), other = Color3.fromRGB(230, 60, 60), none = Color3.fromRGB(255, 160, 40), unk = Color3.fromRGB(150, 150, 150) }
-local OWNTXT = { mine = "you own it", other = "NOT yours", none = "cannot be controlled", unk = "owner unknown" }
-local warnedAge = false
-local function ownerState(d)
-	if d.hum.Health <= 0 or d.root.Anchored then return "none" end
-	local ok, age = pcall(function() return d.root.ReceiveAge end)
-	if not ok or type(age) ~= "number" then
-		if not warnedAge then warnedAge = true bad("BasePart.ReceiveAge is not readable - ownership dots will be gray.") end
-		return "unk"
-	end
-	return age < 0.1 and "mine" or "other"
 end
 
 local lastCount = -1
@@ -472,11 +614,16 @@ local function scan(manual)
 			local m = h.Parent
 			if m and m:IsA("Model") and not npcs[m] and not ignored[m] and not banned[m] and m ~= homeChar and not P:GetPlayerFromCharacter(m) then
 				local root = findRoot(m)
-				if root and S.autoBan and root.Anchored then
+				if root and S.autoBan and grounded(root) then
 					banned[m] = true
 					log("Auto-banned (anchored):", m.Name)
 					rebuildBans()
-				elseif root then addNPC(m, h, root) else ignored[m] = true bad("Skipped", m:GetFullName(), ": no HumanoidRootPart / PrimaryPart / Torso") end
+				elseif root then
+					addNPC(m, h, root)
+				else
+					ignored[m] = true
+					bad("Skipped", m:GetFullName(), ": no HumanoidRootPart / PrimaryPart / Torso")
+				end
 			end
 		end
 	end
@@ -491,22 +638,40 @@ local function scan(manual)
 	end
 end
 
+---------------------------------------------------------------- "All NPCs" entry (top of the list)
+local allBtn = T("TextButton", list, { Size = UDim2.new(1, -6, 0, 28), BackgroundColor3 = C.bg, Text = "  All NPCs",
+	TextXAlignment = Enum.TextXAlignment.Left, Font = Enum.Font.GothamBold, LayoutOrder = 0 })
+allBtn.MouseButton1Click:Connect(function()
+	allSel = not allSel
+	table.clear(selected)
+	primary = nil
+	setStatus(allSel and "All NPCs selected - actions apply to everyone in the list." or "Selection cleared.")
+	refresh()
+end)
+
 refresh = function()
 	local prim = getPrimary()
+	local n = 0
 	for _, d in pairs(npcs) do
-		local tag = (d.frozen and "  [frozen]" or "") .. (d.pocket and "  [pocket]" or "")
+		n += 1
+		local tag = (d.frozen and "  [frozen]" or "") .. (d.pocket and "  [pocket]" or "") .. (d.orbit and "  [orbit]" or "")
 		d.btn.Text = (controlling == d and " * " or "  ") .. d.model.Name .. "  |  " .. d.dist .. "m" .. tag
 		d.btn.BackgroundColor3 = (controlling == d and C.on) or (selected[d] and C.sel) or C.bg
-		d.own = ownerState(d)
-		d.dot.BackgroundColor3 = OWN[d.own]
-		local col = (controlling == d and Color3.fromRGB(60, 255, 90)) or (selected[d] and Color3.fromRGB(255, 220, 60)) or (espAll and Color3.fromRGB(80, 200, 255))
+		d.dot.BackgroundColor3 = OWN[d.own] or OWN.unk
+		local col = (controlling == d and Color3.fromRGB(60, 255, 90)) or (d.esp and Color3.fromRGB(80, 200, 255))
+			or (selected[d] and Color3.fromRGB(255, 220, 60))
 		d.hl.Enabled = col and true or false
 		if col then d.hl.FillColor, d.hl.OutlineColor = col, col end
 	end
-	if prim and prim.hum.Parent then
-		local n = selCount()
-		info.Text = string.format("%s%s\nHP %d/%d  |  spd %s  |  %d studs  |  %s", prim.model.Name, n > 1 and ("  (+" .. (n - 1) .. " more)") or "",
-			math.floor(prim.hum.Health), math.floor(prim.hum.MaxHealth), fmt(prim.speed), prim.dist, OWNTXT[prim.own or "unk"])
+	allBtn.Text = "  All NPCs (" .. n .. ")"
+	allBtn.BackgroundColor3 = allSel and C.sel or C.bg
+	if applyRow then applyRow.Visible = allSel end -- "Apply to new NPCs" only matters for "All NPCs"
+	if allSel then
+		info.Text = "All NPCs (" .. n .. ")" .. (applyNew and "  |  new NPCs get the same" or "")
+	elseif prim and prim.hum.Parent then
+		local c = selCount()
+		info.Text = string.format("%s%s\nHP %d/%d  |  spd %s  |  %d studs  |  %s", prim.model.Name, c > 1 and ("  (+" .. (c - 1) .. " more)") or "",
+			math.floor(prim.hum.Health), math.floor(prim.hum.MaxHealth), fmt(prim.speed), prim.dist, OWNTXT[prim.own] or "")
 	else
 		info.Text = "No NPC selected - click one in the list"
 	end
@@ -530,6 +695,8 @@ local function btn(parent, text, fn, isOn, onText)
 	if type(text) == "function" then labelFn, text = text, text() end
 	local b = T("TextButton", parent, { Text = text, TextWrapped = true, Font = Enum.Font.GothamBold })
 	b.MouseButton1Click:Connect(function()
+		-- while claiming, any action button first brings me back home, then runs the action
+		if claim and b ~= claimBtn and b:IsDescendantOf(scroll) and not (settingsBox and b:IsDescendantOf(settingsBox)) then endClaim() end
 		local ok, e = pcall(fn)
 		if not ok then bad("Error in '" .. text .. "':", e) end
 		refresh()
@@ -553,10 +720,13 @@ end
 local function row(c, specs)
 	local r = T("Frame", c, { Size = UDim2.new(1, 0, 0, 28), BackgroundTransparency = 1, LayoutOrder = nxt() })
 	lay(r, { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4) })
+	local bs = {}
 	for i, s in ipairs(specs) do
 		local b = btn(r, s[1], s[2], s[3], s[4])
 		b.Size, b.LayoutOrder = UDim2.new(1 / #specs, -4 * (#specs - 1) / #specs, 1, 0), i
+		bs[i] = b
 	end
+	return bs
 end
 -- number field: label + box + Reset. Any number is accepted, the box shows get() when not typing.
 local function field(c, name, get, apply, reset)
@@ -608,17 +778,20 @@ row(top, { { "Click to add: OFF", function()
 	setStatus(addMode and "Click an NPC in the world to add it to the list." or "Click to add OFF.")
 end, function() return addMode end, "Click to add: ON" } })
 
----------------------------------------------------------------- right panel: sections
+---------------------------------------------------------------- right panel
+-- above all sections: what you do to "All NPCs" also happens to NPCs that appear later
+applyRow = row(scroll, { { "Apply to new NPCs: OFF", function()
+	applyNew = not applyNew
+	setStatus(applyNew and "ON: what you apply with 'All NPCs' selected is also applied to NPCs that appear later (once they are yours)." or "Apply to new NPCs OFF.")
+end, function() return applyNew end, "Apply to new NPCs: ON" } })[1].Parent
+applyRow.Visible = false
+
 local s1 = section("Control")
-row(s1, {
-	{ "Control NPC", function()
-		if controlling then stopControl("button") return end
-		local t = need()
-		if #t == 0 then return end
-		if #t > 1 then bad("Several selected - controlling only", getPrimary().model.Name) end
-		startControl(getPrimary())
-	end, function() return controlling ~= nil end, "Controlling (stop)" },
-})
+row(s1, { { "Control NPC", function()
+	if controlling then stopControl("button") return end
+	local p = one()
+	if p then startControl(p) end
+end, function() return controlling ~= nil end, "Controlling (stop)" } })
 row(s1, {
 	{ "Click to Move", function()
 		moveMode = not moveMode
@@ -626,140 +799,146 @@ row(s1, {
 	end, function() return moveMode end, "Click to Move: ON" },
 	{ "Follow me", function()
 		toggleProp("following", function(d, s)
-			if controlling == d then bad("Can't follow while you control", d.model.Name) return end
-			if d.frozen or d.pocket then bad(d.model.Name, "is frozen / in pocket.") return end
+			if controlling == d then return end
+			if s and (d.frozen or d.pocket or d.orbit) then return end
 			cancelPath(d)
 			d.following = s
 			if s then standUp(d) end
-		end)
+		end, "Follow me", true)
 	end, function() return any("following") end, "Following me" },
 })
 
 local s2 = section("Actions")
 row(s2, {
 	{ "Disable AI", function()
-		toggleProp("aiOff", function(d, s) d.aiOff = s if s then d.following = false cancelPath(d) end end)
+		toggleProp("aiOff", function(d, s) d.aiOff = s if s then d.following = false cancelPath(d) end end, "Disable AI", true)
 	end, function() return any("aiOff") end, "AI disabled" },
 	{ "Freeze", function()
-		toggleProp("frozen", function(d, s)
-			if controlling == d then bad("Stop controlling", d.model.Name, "first.") return end
-			setFrozen(d, s)
-		end)
+		toggleProp("frozen", function(d, s) if controlling ~= d then setFrozen(d, s) end end, "Freeze", true)
 	end, function() return any("frozen") end, "Unfreeze" },
 })
 row(s2, {
 	{ "Pocket", function()
 		toggleProp("pocket", function(d, s)
-			if controlling == d then bad("Stop controlling", d.model.Name, "first.") return end
-			setPocket(d, s)
-		end)
+			if controlling == d then return end
+			if s then setCarry(d, "pocket") elseif d.pocket then setCarry(d, nil) end
+		end, "Pocket", true)
 	end, function() return any("pocket") end, "In pocket (release)" },
 	{ "Spectate", function()
 		if spectating then stopSpectate() return end
 		if controlling then bad("Stop controlling first.") return end
-		local p = getPrimary()
-		if not p then need() return end
+		local p = one()
+		if not p then return end
 		spectating = p
 		workspace.CurrentCamera.CameraSubject = p.hum
 		hudText()
 	end, function() return spectating ~= nil end, "Watching (stop)" },
 })
 row(s2, { { "Kill", function()
-	-- both ways, to be sure: Health = 0 and the Dead state
-	for _, d in ipairs(need()) do
+	forOwned(need(), "Kill", function(d) -- both ways, to be sure: Health = 0 and the Dead state
 		pcall(function() d.hum.Health = 0 end)
 		pcall(function() d.hum:ChangeState(Enum.HumanoidStateType.Dead) end)
 		log("Killed:", d.model.Name)
-	end
+	end)
 end } })
 
 local s3 = section("Values")
-field(s3, "WalkSpeed", function() local p = getPrimary() return p and p.speed end,
-	function(n) for _, d in ipairs(need()) do d.speed = n applyStats(d) end end,
-	function() for _, d in ipairs(targets()) do d.speed = d.o.speed applyStats(d) end end)
-field(s3, "JumpPower", function() local p = getPrimary() return p and p.jumpPower end,
-	function(n) for _, d in ipairs(need()) do d.jumpPower, d.jumpEdited = n, true applyStats(d) end end,
-	function() for _, d in ipairs(targets()) do d.jumpPower, d.jumpEdited = d.o.jp, false applyStats(d) end end)
+field(s3, "WalkSpeed", function() local p = getPrimary() return p and p.speed end, function(n)
+	forOwned(need(), "WalkSpeed", function(d) d.speed = n applyStats(d) end)
+	if allSel then allVals.speed = n end
+end, function()
+	for _, d in ipairs(targets()) do d.speed = d.o.speed applyStats(d) end
+	if allSel then allVals.speed = nil end
+end)
+field(s3, "JumpPower", function() local p = getPrimary() return p and p.jumpPower end, function(n)
+	forOwned(need(), "JumpPower", function(d) d.jumpPower, d.jumpEdited = n, true applyStats(d) end)
+	if allSel then allVals.jump = n end
+end, function()
+	for _, d in ipairs(targets()) do d.jumpPower, d.jumpEdited = d.o.jp, false applyStats(d) end
+	if allSel then allVals.jump = nil end
+end)
 
 local s4 = section("Teleport")
 row(s4, {
 	{ "Go To", function()
-		local p, mr = getPrimary(), myRoot()
-		if not p then need() return end
+		local p, mr = one(), myRoot()
+		if not p then return end
 		if controlling then bad("Stop controlling first.") return end
 		if mr then mr.CFrame = p.root.CFrame * CFrame.new(0, 3, 6) end
 	end },
 	{ "Bring", function()
-		local t, mr = need(), myRoot()
+		local mr = myRoot()
 		if not mr then return end
-		for i, d in ipairs(t) do
-			if not d.pocket then
-				local a = (i - 1) * 2 * math.pi / #t
-				local off = #t == 1 and Vector3.new(0, 3, -5) or Vector3.new(math.sin(a) * 6, 3, -math.cos(a) * 6)
-				local pos = (mr.CFrame * CFrame.new(off)).Position
-				d.root.CFrame = CFrame.lookAt(pos, Vector3.new(mr.Position.X, pos.Y, mr.Position.Z))
-				d.root.AssemblyLinearVelocity, d.jitUp = Vector3.zero, nil
-				if d.frozen then d.frozenCF = d.root.CFrame pinFrozen(d) end -- frozen NPC stays frozen at the new spot
-			end
-		end
+		local t = {}
+		for _, d in ipairs(need()) do if not (d.pocket or d.orbit) then t[#t + 1] = d end end
+		local i = 0
+		forOwned(t, "Bring", function(d)
+			i += 1
+			local a = (i - 1) * 2 * math.pi / #t
+			local off = #t == 1 and Vector3.new(0, 3, -5) or Vector3.new(math.sin(a) * 6, 3, -math.cos(a) * 6)
+			local pos = (mr.CFrame * CFrame.new(off)).Position
+			d.root.CFrame = CFrame.lookAt(pos, Vector3.new(mr.Position.X, pos.Y, mr.Position.Z))
+			d.root.AssemblyLinearVelocity, d.jitUp = Vector3.zero, nil
+			if d.frozen then d.frozenCF = d.root.CFrame pinFrozen(d) end -- frozen NPC stays frozen at the new spot
+		end)
 	end },
 })
 row(s4, { { "Void", function()
-	-- below workspace.FallenPartsDestroyHeight the engine destroys parts -> the NPC dies / gets removed (and respawns if the game does that)
+	-- below workspace.FallenPartsDestroyHeight the engine destroys parts -> the NPC dies / gets removed
 	local y = workspace.FallenPartsDestroyHeight - 25
-	for _, d in ipairs(need()) do
-		if controlling == d then bad("Stop controlling", d.model.Name, "first.")
-		else
-			setPocket(d, false)
-			setFrozen(d, false)
-			d.aiOff, d.following, d.spinning = false, false, false
-			cancelPath(d)
-			local p = d.root.Position
-			d.root.CFrame, d.root.AssemblyLinearVelocity, d.jitUp = CFrame.new(p.X, y, p.Z), Vector3.zero, nil
-			log("Sent to the void:", d.model.Name)
-		end
-	end
+	local t = {}
+	for _, d in ipairs(need()) do if controlling ~= d then t[#t + 1] = d end end
+	forOwned(t, "Void", function(d)
+		setCarry(d, nil)
+		setFrozen(d, false)
+		d.aiOff, d.following, d.spinning = false, false, false
+		cancelPath(d)
+		local p = d.root.Position
+		d.root.CFrame, d.root.AssemblyLinearVelocity, d.jitUp = CFrame.new(p.X, y, p.Z), Vector3.zero, nil
+		log("Sent to the void:", d.model.Name)
+	end)
 end } })
 
 local s5 = section("Other")
+claimBtn = row(s5, { { "Claim ownership", function()
+	if claim then endClaim() setStatus("Claim cancelled.") return end
+	if controlling then bad("Stop controlling first.") return end
+	local p = one()
+	if not p then return end
+	if isMine(p) then setStatus(p.model.Name .. " is already yours.") return end
+	startClaim(p)
+end, function() return claim ~= nil end, "Claiming... (cancel)" } })[1]
 row(s5, {
 	{ "Sit / Stand", function()
 		local t, sit = need(), false
 		for _, d in ipairs(t) do if d.hum.Sit then sit = true end end
-		for _, d in ipairs(t) do d.hum.Sit = not sit end
-	end, function() for d in pairs(selected) do if d.hum.Sit then return true end end return false end, "Sitting (stand)" },
+		forOwned(t, "Sit", function(d) d.hum.Sit = not sit end)
+	end, function() for _, d in ipairs(targets()) do if d.hum.Sit then return true end end return false end, "Sitting (stand)" },
 	{ "Jump", function()
-		for _, d in ipairs(need()) do
-			if d.frozen or d.pocket then bad(d.model.Name, "is frozen / in pocket.") else standUp(d) d.hum.Jump = true end
-		end
+		local t = {}
+		for _, d in ipairs(need()) do if not (d.frozen or d.pocket or d.orbit) then t[#t + 1] = d end end
+		forOwned(t, "Jump", function(d) standUp(d) d.hum.Jump = true end)
 	end },
 })
-row(s5, { { "Spin", function() toggleProp("spinning", function(d, s) d.spinning = s end) end, function() return any("spinning") end, "Spinning (stop)" } })
+row(s5, { { "Spin", function()
+	toggleProp("spinning", function(d, s) d.spinning = s end, "Spin", true)
+end, function() return any("spinning") end, "Spinning (stop)" } })
 setting(s5, "Spin speed (deg/s)", "spin", "deg/s")
-row(s5, { { "Highlight all NPCs", function() espAll = not espAll end, function() return espAll end, "Highlight all: ON" } })
-row(s5, {
-	{ "Freeze all: OFF", function()
-		freezeAll = not freezeAll
-		if freezeAll then pocketAll = false end
-		for _, d in pairs(npcs) do
-			if controlling ~= d and d.hum.Health > 0 and not d.root.Anchored then
-				if freezeAll then if not d.frozen then setFrozen(d, true) end elseif d.frozen then setFrozen(d, false) end
-			end
-		end
-		setStatus(freezeAll and "Freeze all ON: every NPC in the list, and every new one, gets frozen." or "Freeze all OFF: everyone unfrozen.")
-	end, function() return freezeAll end, "Freeze all: ON" },
-	{ "Pocket all: OFF", function()
-		pocketAll = not pocketAll
-		if pocketAll then freezeAll = false end
-		for _, d in pairs(npcs) do
-			if controlling ~= d and d.hum.Health > 0 and not d.root.Anchored then setPocket(d, pocketAll) end
-		end
-		setStatus(pocketAll and "Pocket all ON: every NPC in the list, and every new one, goes to your pocket." or "Pocket all OFF: everyone released.")
-	end, function() return pocketAll end, "Pocket all: ON" },
-})
+row(s5, { { "Orbit (Omega Flowey)", function()
+	toggleProp("orbit", function(d, s)
+		if controlling == d then return end
+		if s then setCarry(d, "orbit") elseif d.orbit then setCarry(d, nil) end
+	end, "Orbit", true)
+end, function() return any("orbit") end, "Orbiting (release)" } })
+setting(s5, "Orbit radius (studs)", "orbitRadius", "studs")
+setting(s5, "Orbit speed (deg/s)", "orbitSpeed", "deg/s")
+row(s5, { { "Highlight", function()
+	toggleProp("esp", function(d, s) d.esp = s end, "Highlight", false)
+end, function() return any("esp") end, "Highlighted (off)" } })
 
 -- Settings: always the last (bottom) section
 local s6 = section("Settings")
+settingsBox = s6
 row(s6, {
 	{ "Jitter: OFF", function()
 		S.jitter = not S.jitter
@@ -785,23 +964,27 @@ row(s6, {
 		setStatus(S.aiSpam and "Anti-AI spam ON: MoveTo(own position) holds suppressed NPCs." or "Anti-AI spam OFF.")
 	end, function() return S.aiSpam end, "Anti-AI spam: ON" },
 })
-row(s6, {
-	{ "Auto-ban anchored: OFF", function()
-		S.autoBan = not S.autoBan
-		if S.autoBan then
-			local n = 0
-			for _, d in pairs(npcs) do if d.root.Anchored then banNPC(d) n += 1 end end
-			setStatus("Auto-ban anchored ON" .. (n > 0 and (": banned " .. n .. " NPC(s) now.") or "."))
-		else
-			setStatus("Auto-ban anchored OFF.")
-		end
-	end, function() return S.autoBan end, "Auto-ban anchored: ON" },
-})
+row(s6, { { "Try on non-owned: OFF", function()
+	S.tryAll = not S.tryAll
+	setStatus(S.tryAll and "Try on non-owned ON: actions also run on red NPCs, then get rolled back if they did not work." or "Try on non-owned OFF: red NPCs are skipped.")
+end, function() return S.tryAll end, "Try on non-owned: ON" } })
+row(s6, { { "Auto-ban anchored: OFF", function()
+	S.autoBan = not S.autoBan
+	if S.autoBan then
+		local n = 0
+		for _, d in pairs(npcs) do if d.anchored then banNPC(d) n += 1 end end
+		setStatus("Auto-ban anchored ON" .. (n > 0 and (": banned " .. n .. " NPC(s) now.") or "."))
+	else
+		setStatus("Auto-ban anchored OFF.")
+	end
+end, function() return S.autoBan end, "Auto-ban anchored: ON" } })
 setting(s6, "Anti-AI rate (per sec)", "aiRate", "/s")
 setting(s6, "Jitter rate (per sec)", "jitRate", "/s")
 setting(s6, "Jitter size (studs)", "jitAmp", "studs", function() for _, d in pairs(npcs) do unJitter(d) end end)
 setting(s6, "Hide depth (studs)", "hideDepth", "studs")
 setting(s6, "Pocket depth (studs)", "pocketDepth", "studs")
+setting(s6, "Claim height (studs)", "claimHeight", "studs")
+setting(s6, "Try check after (sec)", "tryWait", "s")
 setting(s6, "Auto-scan every (sec)", "interval", "s")
 row(s6, {
 	{ "Ban selected", function() for _, d in ipairs(need()) do banNPC(d) end end },
@@ -841,7 +1024,7 @@ T("TextLabel", s6, { Size = UDim2.new(1, 0, 0, 48), LayoutOrder = nxt(), RichTex
 	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, TextColor3 = Color3.fromRGB(170, 170, 180),
 	Text = "Dot next to an NPC name: <font color='#3cdc5a'>green</font> = you own it (commands work), "
 		.. "<font color='#e63c3c'>red</font> = the server or another player owns it, "
-		.. "<font color='#ffa028'>orange</font> = anchored or dead (cannot be controlled), gray = unknown." })
+		.. "<font color='#ffa028'>orange</font> = its body is anchored to the map or it is dead (cannot move), gray = unknown." })
 T("TextLabel", s6, { Size = UDim2.new(1, 0, 0, 22), LayoutOrder = nxt(), Font = Enum.Font.GothamBold,
 	TextColor3 = Color3.fromRGB(150, 150, 165), Text = "Idea: Vensik  |  Made by Claude AI" })
 
@@ -867,33 +1050,33 @@ local function tryAdd() -- true if the click hit a humanoid model
 		if not root then bad("Click to add:", m:GetFullName(), "has no root part.") return true end
 		d = addNPC(m, m:FindFirstChildOfClass("Humanoid"), root)
 	end
-	if not (UIS:IsKeyDown(Enum.KeyCode.LeftControl) or UIS:IsKeyDown(Enum.KeyCode.RightControl)) then table.clear(selected) end
+	local ctrl = UIS:IsKeyDown(Enum.KeyCode.LeftControl) or UIS:IsKeyDown(Enum.KeyCode.RightControl)
+	if not ctrl then allSel = false table.clear(selected) end
 	selected[d], primary, anchorSel = true, d, d
 	setStatus("Added / selected: " .. m.Name)
 	return true
 end
 local function doMove()
-	local t = targets()
-	if #t == 0 then bad("Click to Move is ON but no NPC is selected.") return end
+	local t = {}
+	for _, d in ipairs(targets()) do if not (d.frozen or d.pocket or d.orbit or controlling == d) then t[#t + 1] = d end end
+	if #t == 0 then bad("Click to Move: no movable NPC selected (frozen / pocket / orbit / controlled ones are skipped).") return end
 	local ig = { myChar() }
 	for _, d in ipairs(t) do ig[#ig + 1] = d.model end
 	local res = ray(ig)
 	if not res then bad("Click missed (sky?). Click on the ground.") return end
-	for i, d in ipairs(t) do
-		if d.frozen or d.pocket or controlling == d then
-			bad(d.model.Name, "is frozen / in pocket / controlled - skipped.")
-		else
-			local a, p = (i - 1) * 2 * math.pi / #t, res.Position
-			if #t > 1 then p += Vector3.new(math.cos(a) * 3, 0, math.sin(a) * 3) end
-			d.following = false
-			walkPath(d, p)
-		end
-	end
+	local i = 0
+	forOwned(t, "Click to Move", function(d)
+		i += 1
+		local a, p = (i - 1) * 2 * math.pi / #t, res.Position
+		if #t > 1 then p += Vector3.new(math.cos(a) * 3, 0, math.sin(a) * 3) end
+		d.following = false
+		walkPath(d, p)
+	end)
 end
 
 ---------------------------------------------------------------- input
 hud.MouseButton1Click:Connect(function()
-	if controlling then stopControl("HUD button") else stopSpectate() end
+	if controlling then stopControl("HUD button") elseif claim then endClaim() else stopSpectate() end
 	refresh()
 end)
 track(UIS.InputBegan:Connect(function(input, gp)
@@ -919,14 +1102,15 @@ track(player.CharacterAdded:Connect(function(c)
 		stopControl("your character respawned", true)
 		refresh()
 	end
+	if claim then claim = nil hudText() end
 end))
 
 ---------------------------------------------------------------- physics steps (right before physics)
--- Anti-AI: a suppressed NPC that stands still keeps getting "walk to where you are", faster than the server AI.
+-- Anti-AI spam: a suppressed NPC that stands still keeps getting "walk to where you are".
 local function antiAI(dt)
 	if not S.aiSpam then return end
 	for _, s in pairs(npcs) do
-		if s.root.Parent and suppressed(s) and not s.pocket and not s.target and not s.following and not (controlling == s and s.moving) then
+		if s.root.Parent and suppressed(s) and not (s.pocket or s.orbit) and not s.target and not s.following and not (controlling == s and s.moving) then
 			s.aiAcc += dt
 			if s.aiAcc >= 1 / S.aiRate then s.aiAcc = 0 s.hum:MoveTo(s.root.Position) end
 		end
@@ -937,7 +1121,7 @@ local function jitter(dt)
 	for _, d in pairs(npcs) do
 		local r = d.root
 		if r.Parent then
-			if S.jitter and suppressed(d) and not d.pocket and not r.Anchored and d.hum.Health > 0 then
+			if S.jitter and suppressed(d) and not (d.pocket or d.orbit) and not d.anchored and d.hum.Health > 0 then
 				d.jitAcc += dt
 				if d.jitAcc >= 1 / S.jitRate then
 					d.jitAcc = 0
@@ -967,20 +1151,42 @@ local function bodyStep()
 	end
 	if collideSaved then unclip(collideSaved) collideSaved = nil end
 end
--- Pocket: NPCs float under me (a small ring if there are several), no collisions, no velocity.
-local function pocketStep()
+-- Pocket (under me, a small ring if there are several) and Orbit (circle around me): no collisions, no velocity.
+local function carryStep()
 	local mr = myRoot()
 	if not mr then return end
-	local pl = {}
-	for _, d in pairs(npcs) do if d.pocket and d.root.Parent then pl[#pl + 1] = d end end
-	table.sort(pl, byId)
-	for i, d in ipairs(pl) do
-		local a = (i - 1) * 2 * math.pi / #pl
-		local off = #pl == 1 and Vector3.zero or Vector3.new(math.cos(a) * 2.5, 0, math.sin(a) * 2.5)
+	local pk, ob = {}, {}
+	for _, d in pairs(npcs) do
+		if d.root.Parent then
+			if d.pocket then pk[#pk + 1] = d elseif d.orbit then ob[#ob + 1] = d end
+		end
+	end
+	table.sort(pk, byId)
+	table.sort(ob, byId)
+	local function hold(d, cf)
 		noclip(d.model, d.coll)
-		d.root.CFrame = CFrame.new(mr.Position + Vector3.new(0, -S.pocketDepth, 0) + off)
+		d.root.CFrame = cf
 		d.root.AssemblyLinearVelocity, d.root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
 	end
+	for i, d in ipairs(pk) do
+		local a = (i - 1) * 2 * math.pi / #pk
+		local off = #pk == 1 and Vector3.zero or Vector3.new(math.cos(a) * 2.5, 0, math.sin(a) * 2.5)
+		hold(d, CFrame.new(mr.Position + Vector3.new(0, -S.pocketDepth, 0) + off))
+	end
+	local base = os.clock() * math.rad(S.orbitSpeed)
+	for i, d in ipairs(ob) do
+		local a = base + (i - 1) * 2 * math.pi / #ob
+		local pos = mr.Position + Vector3.new(math.cos(a) * S.orbitRadius, 0, math.sin(a) * S.orbitRadius)
+		hold(d, CFrame.lookAt(pos, Vector3.new(mr.Position.X, pos.Y, mr.Position.Z)))
+	end
+end
+-- Claim: hover above the NPC so I am the closest player
+local function claimStep()
+	if not claim then return end
+	local d, r = claim.d, myRoot()
+	if not r or npcs[d.model] ~= d or not d.root.Parent then endClaim() return end
+	r.Anchored = true
+	r.CFrame = CFrame.new(d.root.Position + Vector3.new(0, S.claimHeight, 0)) * r.CFrame.Rotation
 end
 local warned = {}
 local function safe(name, f, ...)
@@ -990,15 +1196,17 @@ end
 local function physicsStep(dt)
 	safe("Jitter", jitter, dt)
 	safe("Keep-near", bodyStep)
-	safe("Pocket", pocketStep)
+	safe("Carry", carryStep)
+	safe("Claim", claimStep)
 end
 local okPS, preSim = pcall(function() return RS.PreSimulation end)
 if okPS and preSim then track(preSim:Connect(physicsStep)) else track(RS.Stepped:Connect(function(_, dt) physicsStep(dt) end)) end
 
----------------------------------------------------------------- per-frame: spin, anti-AI, driving the controlled NPC
+---------------------------------------------------------------- per-frame: ownership, spin, anti-AI, driving the controlled NPC
 track(RS.RenderStepped:Connect(function(dt)
+	safe("Ownership", ownStep)
 	for _, s in pairs(npcs) do
-		if s.root.Parent and s.spinning and not s.frozen and not s.pocket then
+		if s.root.Parent and s.spinning and not s.frozen and not (s.pocket or s.orbit) then
 			s.root.CFrame *= CFrame.Angles(0, math.rad(S.spin) * dt, 0)
 		end
 	end
@@ -1018,7 +1226,7 @@ track(RS.RenderStepped:Connect(function(dt)
 		d.moveTime += dt
 		if d.moveTime > 1.5 and not d.warned and d.root.AssemblyLinearVelocity.Magnitude < 0.5 then
 			d.warned = true
-			bad("The NPC is not moving. Possible reasons: no network ownership (turn on 'Keep my char near'), Anchored parts, a server script controls it, or a wall.")
+			bad("The NPC is not moving. Possible reasons: lost network ownership, Anchored parts, a server script controls it, or a wall.")
 		end
 	elseif d.moving then
 		d.moving = false
@@ -1026,7 +1234,7 @@ track(RS.RenderStepped:Connect(function(dt)
 	end
 end))
 
----------------------------------------------------------------- background: list, followers, ownership watchdog
+---------------------------------------------------------------- background: list, followers, watchdog, claim, apply to new
 local function tick()
 	local mr = myRoot()
 	local followers = {}
@@ -1035,17 +1243,31 @@ local function tick()
 			removeNPC(d, false)
 		elseif d.root.Parent then
 			d.dist = mr and math.floor((d.root.Position - mr.Position).Magnitude) or 0
+			d.anchored = grounded(d.root)
+			if d.anchored and S.autoBan and controlling ~= d then banNPC(d) end
 			if d.following and controlling ~= d then followers[#followers + 1] = d end
 			-- watchdog: a frozen NPC that lost ownership is put back to its spot as soon as ownership returns
 			if d.frozen then
-				local o = ownerState(d)
-				if o == "other" then
+				if d.own == "other" then
 					if not d.lost then d.lost = true bad(d.model.Name, ": lost ownership while frozen.") end
-				elseif o == "mine" and d.lost then
+				elseif d.own == "mine" and d.lost then
 					d.lost = false
 					d.root.CFrame, d.root.AssemblyLinearVelocity, d.jitUp = d.frozenCF, Vector3.zero, nil
 					pinFrozen(d)
 					log("Ownership back:", d.model.Name, "- returned to its frozen spot.")
+				end
+			end
+			-- apply to new NPCs: what was applied to "All NPCs" (needs ownership, except Highlight)
+			if applyNew and not d.newDone then
+				if allState.esp and not d.esp then d.esp = true end
+				if isMine(d) and not d.anchored and controlling ~= d then
+					for prop, val in pairs(allState) do
+						if val and not d[prop] and allFns[prop] then pcall(allFns[prop], d, true) end
+					end
+					if allVals.speed then d.speed = allVals.speed end
+					if allVals.jump then d.jumpPower, d.jumpEdited = allVals.jump, true end
+					pcall(applyStats, d)
+					d.newDone = true
 				end
 			end
 		end
@@ -1059,6 +1281,11 @@ local function tick()
 			local f = Vector3.new(goal.X - d.root.Position.X, 0, goal.Z - d.root.Position.Z)
 			d.hum:MoveTo(f.Magnitude > 2.2 and goal or d.root.Position)
 		end
+	end
+	if claim and not claim.told and isMine(claim.d) then
+		claim.told = true
+		setStatus(claim.d.model.Name .. " is yours now! Pick an action - you will be sent back.")
+		log("Ownership claimed:", claim.d.model.Name)
 	end
 	-- I am invisible (to myself) only while my body hides under the controlled NPC
 	local wantHidden = controlling ~= nil and keepClose
@@ -1074,9 +1301,10 @@ end
 closeAll = function()
 	if not alive then return end
 	alive = false
+	pcall(endClaim)
 	pcall(stopControl, "closing")
 	pcall(stopSpectate)
-	for _, d in pairs(npcs) do pcall(removeNPC, d, false) end -- unfreeze, release pocket, reset speed, remove highlights
+	for _, d in pairs(npcs) do pcall(removeNPC, d, false) end -- unfreeze, release pocket / orbit, reset speed, remove highlights
 	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
 	if collideSaved then unclip(collideSaved) collideSaved = nil end
 	pcall(setAlpha, 0)
@@ -1103,5 +1331,5 @@ task.spawn(function()
 	end
 end)
 
-setStatus("Click = select / deselect, Ctrl / Shift = multi-select.")
+setStatus("Click = select / deselect, Ctrl / Shift = multi-select, 'All NPCs' = everyone.")
 log("Ready. Use the 'NPC Menu' button to open / close the menu (you can drag it).")
