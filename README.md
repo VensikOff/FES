@@ -5,4 +5,4 @@ FE Scripts made by me
 ```
 loadstring(game:HttpGet("https://raw.githubusercontent.com/VensikOff/FES/refs/heads/main/NPCController/lastest.luau"))()
 ```
-This script fully done by Claude AI, this script was inpired by two nps controlers scripts made by Im_patrick on youtube
+This script fully done by Claude AI, this script was inspired by two nps controlers scripts made by Im_patrick on youtube
