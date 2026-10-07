@@ -17,7 +17,7 @@ local S = {
 	jitAmp = 0.01,      -- jitter size, studs
 	jitter = true,      -- jitter on NPCs whose AI is held down
 	aiSpam = false,     -- anti-AI MoveTo spam
-	autoBan = false,    -- automatically ban NPCs whose body is anchored to the map
+	autoBan = true,    -- automatically ban NPCs whose body is anchored to the map
 	tryAll = false,     -- Try on non-owned NPCs: apply anyway, then check and roll back if it did not work
 	tryWait = 1.5,      -- seconds to wait before that check
 	freezeMode = "hard",-- "soft" / "hard" / "full"
@@ -36,7 +36,7 @@ local NEXT = { soft = "hard", hard = "full", full = "soft" }
 local npcs, nextId, selected, primary, anchorSel = {}, 0, {}, nil, nil
 local allSel, applyNew, allState, allFns, allVals = false, false, {}, {}, {} -- "All NPCs" + "Apply to new NPCs"
 local controlling, possessed, homeChar, saved, spectating, claim = nil, false, nil, nil, nil, nil
-local keepClose, moveMode, addMode, autoScan, lastScan = true, false, false, false, 0
+local keepClose, moveMode, addMode, autoScan, lastScan = true, false, false, true, 0
 local ignored, banned = setmetatable({}, { __mode = "k" }), {}
 local collideSaved, homeCF, bodyMoved, hiddenNow = nil, nil, false, false
 local order, features, fields = 0, {}, {}
